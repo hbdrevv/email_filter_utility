@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+env/
+*.log
+
+# Data files
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.parquet
+
+# Build/packaging
+build/
+dist/
+*.spec
+*.app/
+*.msi
+*.dmg
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,6 @@
+Email,First,Last
+alice@example.com,Alice,One
+bob.smith@gmail.com,Bob,Smith
+carol@bücher.de,Carol,Buch
+"dave@example.com; eve@example.com",Dave,EvePair
+invalid-email,Ina,Valid

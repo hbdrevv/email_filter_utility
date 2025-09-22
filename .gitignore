@@ -13,6 +13,8 @@ env/
 *.xls
 *.parquet
 
+!examples/*.csv
+
 # Build/packaging
 build/
 dist/

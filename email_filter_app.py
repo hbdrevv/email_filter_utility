@@ -11,7 +11,23 @@ import idna
 import pandas as pd
 import gradio as gr
 
-# Candidate email headers for auto-detection
+# ---- Patch gradio_client schema parser (handles additionalProperties: true/false) ----
+try:
+    import gradio_client.utils as _gc_utils  # type: ignore
+    _orig_get_type = _gc_utils.get_type  # keep original for fallback
+
+    def _safe_get_type(schema):
+        # Some versions of gradio/gradio_client may pass bare booleans in schema positions.
+        # Treat those as "any" to avoid: TypeError: argument of type 'bool' is not iterable
+        if isinstance(schema, bool):
+            return "any"
+        return _orig_get_type(schema)
+
+    _gc_utils.get_type = _safe_get_type  # monkey-patch
+except Exception:
+    pass
+
+# ---- Email helpers ----
 CANDIDATE_EMAIL_COLS = [
     "email", "e-mail", "Email", "EMAIL",
     "Email Address", "email_address", "EmailAddress", "user_email"
@@ -40,10 +56,12 @@ def canonicalize_email(raw_email: str, collapse_gmail_plus=True, collapse_gmail_
     if "@" not in e:
         return e
     local, domain = e.split("@", 1)
+    # Punycode the domain if needed (IDN-safe)
     try:
         domain = idna.encode(domain).decode("ascii")
     except Exception:
         pass
+    # Normalize common Gmail quirks
     if domain in ("gmail.com", "googlemail.com"):
         if collapse_gmail_plus and "+" in local:
             local = local.split("+", 1)[0]
@@ -59,6 +77,7 @@ def canonicalize_cell_to_list(cell: object, collapse_gmail_plus: bool, collapse_
     ]
 
 def read_table(file_obj) -> pd.DataFrame:
+    """Read CSV/XLSX with a tolerant fallback."""
     name = getattr(file_obj, "name", None) or getattr(file_obj, "orig_name", None)
     suffix = Path(name).suffix.lower() if name else ""
     if suffix in {".xlsx", ".xls"}:
@@ -79,6 +98,7 @@ def make_download(bytes_io: io.BytesIO, filename: str):
         f.write(bytes_io.read())
     return out_path
 
+# ---- Core filtering ----
 def filter_emails(client_file, supp_file, email_col_name, dedupe_before,
                   collapse_gmail_plus, collapse_gmail_dots, drop_invalid_or_empty):
     import traceback
@@ -94,14 +114,14 @@ def filter_emails(client_file, supp_file, email_col_name, dedupe_before,
         if supp_df.empty:
             return "❌ Suppression file has no rows.", None, None
 
-        # Detect email columns
+        # Prefer explicit column, otherwise autodetect
         email_col_name = (email_col_name or "").strip()
         client_email_col = email_col_name or autodetect_email_col(client_df.columns)
         supp_email_col = email_col_name or autodetect_email_col(supp_df.columns)
         if not client_email_col or not supp_email_col:
-            return "❌ Could not detect the email column.", None, None
+            return "❌ Could not detect the email column. Please enter it explicitly.", None, None
 
-        # Suppression set
+        # Build suppression set (canonicalized)
         suppression_set: Set[str] = set()
         for cell in supp_df[supp_email_col].tolist():
             suppression_set.update(
@@ -117,26 +137,58 @@ def filter_emails(client_file, supp_file, email_col_name, dedupe_before,
 
         before_total = len(client_df)
 
-        if dedupe_before:
-            client_df = client_df.drop_duplicates(subset=["_primary_email"], keep="first")
+        # Masks on the ORIGINAL client_df (do not drop yet)
+        empty_or_invalid_mask = client_df["_emails_list"].apply(lambda lst: len(lst) == 0)
 
-        def row_is_removed(row) -> bool:
-            if drop_invalid_or_empty and not row["_emails_list"]:
-                return True
-            return any(em in suppression_set for em in row["_emails_list"])
+        # Duplicate detection within the client file (by canonical primary email)
+        # Mark any *later* occurrences as duplicates.
+        dup_within_client_mask = client_df.duplicated(subset=["_primary_email"], keep="first")
 
-        removal_mask = client_df.apply(row_is_removed, axis=1)
-        removed_rows = client_df[removal_mask].drop(columns=["_emails_list", "_primary_email"])
-        kept_rows = client_df[~removal_mask].drop(columns=["_emails_list", "_primary_email"])
+        # Compute reason for removal with priority order:
+        # 1) suppression, 2) empty/invalid (if option), 3) duplicate within client (if option)
+        def removal_reason(row, idx):
+            # suppression first (strongest reason)
+            if any(em in suppression_set for em in row["_emails_list"]):
+                return "suppression_match"
+            # invalid/empty
+            if drop_invalid_or_empty and empty_or_invalid_mask.iloc[idx]:
+                return "empty_or_invalid_email"
+            # duplicate within client
+            if dedupe_before and dup_within_client_mask.iloc[idx]:
+                return "duplicate_in_client"
+            return ""
 
+        # Evaluate reasons row-by-row
+        reasons = []
+        # preserve positional index for mask lookups
+        for i, r in client_df.iterrows():
+            reasons.append(removal_reason(r, client_df.index.get_loc(i)))
+        reasons = pd.Series(reasons, index=client_df.index)
+
+        removal_mask = reasons != ""
+        removed_rows = client_df[removal_mask].drop(columns=["_emails_list", "_primary_email"]).copy()
+        kept_rows = client_df[~removal_mask].drop(columns=["_emails_list", "_primary_email"]).copy()
+
+        # Add reason column to removed rows for audit
+        removed_rows.insert(0, "Reason", reasons[removal_mask].values)
+
+        # Breakdown counts
+        suppression_removed = int((reasons == "suppression_match").sum())
+        empty_removed = int((reasons == "empty_or_invalid_email").sum())
+        duplicate_removed = int((reasons == "duplicate_in_client").sum())
+
+        # Outputs
         out_filtered = io.BytesIO(); kept_rows.to_csv(out_filtered, index=False)
         out_removed = io.BytesIO(); removed_rows.to_csv(out_removed, index=False)
 
         msg = (
-            f"✅ Done.\n"
+            "✅ Done.\n"
             f"- Rows before filter: {before_total:,}\n"
-            f"- Removed: {len(removed_rows):,}\n"
-            f"- Kept: {len(kept_rows):,}\n"
+            f"- Removed total: {int(removal_mask.sum()):,}\n"
+            f"  • Suppression matches: {suppression_removed:,}\n"
+            f"  • Empty/invalid emails: {empty_removed:,}\n"
+            f"  • Duplicates in client: {duplicate_removed:,}\n"
+            f"- Kept (ready to upload): {len(kept_rows):,}\n"
             f"- Gmail canonicalization: plus={'ON' if collapse_gmail_plus else 'OFF'}, "
             f"dots={'ON' if collapse_gmail_dots else 'OFF'}"
         )
@@ -147,14 +199,15 @@ def filter_emails(client_file, supp_file, email_col_name, dedupe_before,
         traceback.print_exc()
         return f"❌ {type(e).__name__}: {e}", None, None
 
-with gr.Blocks(title="Email Filter") as demo:
+# ---- UI ----
+with gr.Blocks(title="Email Filter", analytics_enabled=False) as demo:
     gr.Markdown("## 📧 Email Filter\nUpload your **Client List** and **Klaviyo Suppressions** (CSV or Excel).")
     with gr.Row():
         client_file = gr.File(label="Client List (CSV or XLSX)", file_types=[".csv", ".xlsx"])
         supp_file = gr.File(label="Klaviyo Suppressions (CSV or XLSX)", file_types=[".csv", ".xlsx"])
     email_col = gr.Textbox(label="Email column name (optional)", placeholder="e.g., Email or Email Address")
     with gr.Accordion("Options", open=False):
-        dedupe_before = gr.Checkbox("Dedupe client list", value=True)
+        dedupe_before = gr.Checkbox("Dedupe client list (remove duplicates within client file)", value=True)
         collapse_gmail_plus = gr.Checkbox("Treat Gmail plus aliases as the same", value=True)
         collapse_gmail_dots = gr.Checkbox("Treat Gmail dots as the same (a.lex → alex)", value=False)
         drop_invalid_or_empty = gr.Checkbox("Remove invalid/empty emails", value=True)
@@ -162,9 +215,39 @@ with gr.Blocks(title="Email Filter") as demo:
     status = gr.Markdown()
     dl_filtered = gr.File(label="Download: Filtered Client List", interactive=False)
     dl_removed = gr.File(label="Download: Removed Rows (Audit)", interactive=False)
-    run_btn.click(filter_emails,
-                  inputs=[client_file, supp_file, email_col, dedupe_before, collapse_gmail_plus, collapse_gmail_dots, drop_invalid_or_empty],
-                  outputs=[status, dl_filtered, dl_removed])
+    run_btn.click(
+        filter_emails,
+        inputs=[client_file, supp_file, email_col, dedupe_before, collapse_gmail_plus, collapse_gmail_dots, drop_invalid_or_empty],
+        outputs=[status, dl_filtered, dl_removed]
+    )
 
+# ---- Launch ----
 if __name__ == "__main__":
-    demo.launch()
+    # Toggle share link: GRADIO_SHARE=1 python email_filter_app.py
+    share = os.getenv("GRADIO_SHARE") == "1"
+
+    # Fixed port or auto-pick: set PORT to a number (e.g., 7861) or 0 (auto).
+    port_env = os.getenv("PORT", "")
+    server_port = int(port_env) if port_env.isdigit() else 0  # 0 = find free port
+
+    try:
+        demo.launch(
+            server_name="127.0.0.1",
+            server_port=server_port if server_port > 0 else None,  # None -> auto-pick
+            show_error=True,
+            inbrowser=False,
+            share=share,
+        )
+    except ValueError as e:
+        # Auto-fallback if localhost is blocked by a proxy/VPN
+        if "localhost is not accessible" in str(e):
+            print("⚠️ Localhost appears blocked. Relaunching with share=True ...")
+            demo.launch(
+                server_name="0.0.0.0",
+                server_port=server_port if server_port > 0 else None,
+                show_error=True,
+                inbrowser=False,
+                share=True,
+            )
+        else:
+            raise

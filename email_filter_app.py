@@ -202,24 +202,48 @@ def filter_emails(client_file, supp_file, email_col_name, dedupe_before,
 # ---- UI ----
 with gr.Blocks(title="Email Filter", analytics_enabled=False) as demo:
     gr.Markdown("## 📧 Email Filter\nUpload your **Client List** and **Klaviyo Suppressions** (CSV or Excel).")
+
     with gr.Row():
         client_file = gr.File(label="Client List (CSV or XLSX)", file_types=[".csv", ".xlsx"])
         supp_file = gr.File(label="Klaviyo Suppressions (CSV or XLSX)", file_types=[".csv", ".xlsx"])
-    email_col = gr.Textbox(label="Email column name (optional)", placeholder="e.g., Email or Email Address")
+
+    email_col = gr.Textbox(
+        label="Email column name (optional)",
+        placeholder="e.g., Email or Email Address"
+    )
+
     with gr.Accordion("Options", open=False):
-        dedupe_before = gr.Checkbox("Dedupe client list (remove duplicates within client file)", value=True)
-        collapse_gmail_plus = gr.Checkbox("Treat Gmail plus aliases as the same", value=True)
-        collapse_gmail_dots = gr.Checkbox("Treat Gmail dots as the same (a.lex → alex)", value=False)
-        drop_invalid_or_empty = gr.Checkbox("Remove invalid/empty emails", value=True)
+        dedupe_before = gr.Checkbox(
+            label="Dedupe client list (remove duplicates within client file)",
+            value=True
+        )
+        collapse_gmail_plus = gr.Checkbox(
+            label="Treat Gmail plus aliases as the same (e.g. alex+test@gmail.com → alex@gmail.com)",
+            value=True
+        )
+        collapse_gmail_dots = gr.Checkbox(
+            label="Treat Gmail dots as the same (e.g. a.lex@gmail.com → alex@gmail.com)",
+            value=False
+        )
+        drop_invalid_or_empty = gr.Checkbox(
+            label="Remove invalid or empty emails",
+            value=True
+        )
+
     run_btn = gr.Button("Filter & Prepare Downloads", variant="primary")
     status = gr.Markdown()
     dl_filtered = gr.File(label="Download: Filtered Client List", interactive=False)
     dl_removed = gr.File(label="Download: Removed Rows (Audit)", interactive=False)
+
     run_btn.click(
         filter_emails,
-        inputs=[client_file, supp_file, email_col, dedupe_before, collapse_gmail_plus, collapse_gmail_dots, drop_invalid_or_empty],
+        inputs=[
+            client_file, supp_file, email_col,
+            dedupe_before, collapse_gmail_plus, collapse_gmail_dots, drop_invalid_or_empty
+        ],
         outputs=[status, dl_filtered, dl_removed]
     )
+
 
 # ---- Launch ----
 if __name__ == "__main__":
